@@ -1,0 +1,88 @@
+syntax = "proto3";
+
+package jobmanager.v1;
+
+option go_package = "github.com/greatmazinger/bantay/proto/jobmanager/v1;jobmanagerv1";
+
+// JobService runs processes on behalf of authenticated clients.
+//
+// The caller's identity is the Common Name of the client certificate presented
+// during the mTLS handshake. No request message carries an owner or actor
+// field: a client cannot assert an identity on the wire.
+//
+// A caller may act only on jobs it started. A job owned by someone else is
+// indistinguishable from one that never existed -- both yield NOT_FOUND.
+service JobService {
+  // Start launches a process and returns immediately with its job ID.
+  rpc Start(StartRequest) returns (StartResponse);
+
+  // Stop terminates a job and every process it spawned. Stopping a job that
+  // has already exited succeeds and does nothing.
+  rpc Stop(StopRequest) returns (StopResponse);
+
+  // Status reports a job's current state.
+  rpc Status(StatusRequest) returns (StatusResponse);
+
+  // Output streams a job's combined stdout and stderr, beginning at the first
+  // byte the process wrote, regardless of when the client attaches. The stream
+  // ends when the job has exited and all its output has been delivered, or when
+  // the client disconnects. Each call is independent: a client that reconnects
+  // receives the stream from the beginning.
+  rpc Output(OutputRequest) returns (stream OutputChunk);
+}
+
+message StartRequest {
+  // Absolute path or PATH-resolvable name of the program to execute. The
+  // command is executed directly; it is not interpreted by a shell.
+  string command = 1;
+
+  // Arguments passed to the program, excluding argv[0].
+  repeated string args = 2;
+}
+
+message StartResponse {
+  string job_id = 1;
+}
+
+message StopRequest {
+  string job_id = 1;
+}
+
+// Intentionally empty. Defined as a named message rather than
+// google.protobuf.Empty so that fields can be added without changing the
+// method signature.
+message StopResponse {}
+
+message StatusRequest {
+  string job_id = 1;
+}
+
+message StatusResponse {
+  JobState state = 1;
+
+  // Present only once the job has terminated. A job killed by a signal reports
+  // -1. Absent while the job is running.
+  optional int32 exit_code = 2;
+}
+
+message OutputRequest {
+  string job_id = 1;
+}
+
+message OutputChunk {
+  bytes data = 1;
+}
+
+enum JobState {
+  // Never sent by the server; present because proto3 enums must define zero.
+  JOB_STATE_UNSPECIFIED = 0;
+
+  // The process is executing.
+  JOB_STATE_RUNNING = 1;
+
+  // The process exited on its own. Consult exit_code for the result.
+  JOB_STATE_DONE = 2;
+
+  // The process was terminated by a Stop call.
+  JOB_STATE_STOPPED = 3;
+}
