@@ -31,6 +31,26 @@ type mockProcess struct {
 	ctx      context.Context
 	out      io.Writer
 	output   []byte
+
+	// terminated records whether Stop reached for the process-group fallback,
+	// which it only does for a manager configured without a cgroup.
+	mu         sync.Mutex
+	terminated bool
+}
+
+func (m *mockProcess) Terminate() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.terminated = true
+	// A real Terminate kills the group, which ends the Wait below. The mock's
+	// Wait blocks on its context, so releasing it is the equivalent.
+	return nil
+}
+
+func (m *mockProcess) wasTerminated() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.terminated
 }
 
 func (m *mockProcess) Start() error {
@@ -513,7 +533,8 @@ type steppedProcess struct {
 	next  chan struct{} // one receive per step after the first
 }
 
-func (p *steppedProcess) Start() error { return nil }
+func (p *steppedProcess) Start() error     { return nil }
+func (p *steppedProcess) Terminate() error { return nil }
 
 func (p *steppedProcess) Wait() error {
 	for i, step := range p.steps {
@@ -640,6 +661,10 @@ type blockingProcess struct {
 
 func (p *blockingProcess) Start() error { return nil }
 
+// Deliberately does not release: this mock exists so a test can hold the job
+// running while it checks that Stop has not returned. The test releases it.
+func (p *blockingProcess) Terminate() error { return nil }
+
 func (p *blockingProcess) Wait() error {
 	<-p.release
 	return errKilled
@@ -711,5 +736,103 @@ func testStopIsSynchronous(t *testing.T) {
 	}
 	if snap.State != StateStopped {
 		t.Errorf("state = %q after Stop returned, want %q", snap.State, StateStopped)
+	}
+}
+
+// TestManager_ReapKillsTheCgroup covers the job that nobody stopped. Stop
+// writes cgroup.kill on its own path, but a job that simply exited leaves
+// whatever its descendants became, and rmdir on a populated cgroup fails, so
+// without a kill here both the processes and the directory survive the job.
+//
+// Like the other cgroup tests this runs against an ordinary directory and
+// asserts what the service wrote, not what the kernel did with it.
+func TestManager_ReapKillsTheCgroup(t *testing.T) {
+	synctest.Test(t, testReapKillsTheCgroup)
+}
+
+func testReapKillsTheCgroup(t *testing.T) {
+	root := t.TempDir()
+
+	// No ctx field, so Wait returns immediately: the job ends on its own and
+	// nothing calls Stop.
+	newProc := func(ctx context.Context, spec ProcessSpec) Process {
+		return &mockProcess{}
+	}
+	mgr := NewManager(NewRegistry(), &mockAuthz{}, newTestIDGen(),
+		newProc, Config{CgroupRoot: root})
+
+	jobID, err := mgr.Start(astrid, "true", nil)
+	if err != nil {
+		t.Fatalf("Start error: %v", err)
+	}
+
+	// Let the reaping goroutine run to completion, including Destroy's retries.
+	synctest.Wait()
+	time.Sleep(3 * time.Second)
+	synctest.Wait()
+
+	got, err := os.ReadFile(filepath.Join(root, jobID, "cgroup.kill"))
+	if err != nil {
+		t.Fatalf("reap should have written cgroup.kill for a job nobody stopped: %v", err)
+	}
+	if string(got) != "1" {
+		t.Errorf("cgroup.kill = %q, want %q", got, "1")
+	}
+}
+
+// TestManager_StopWithoutACgroupKillsTheProcessGroup covers the default
+// deployment, where --cgroup-root is empty.
+//
+// There Stop has no cgroup.kill to write, and cancelling the context signals
+// the leader alone, leaving its children reparented and running. The proto
+// promises Stop terminates "a job and every process it spawned" without
+// qualification, so the process group is the fallback.
+func TestManager_StopWithoutACgroupKillsTheProcessGroup(t *testing.T) {
+	var proc *mockProcess
+	newProc := func(ctx context.Context, spec ProcessSpec) Process {
+		proc = &mockProcess{ctx: ctx}
+		return proc
+	}
+	// No CgroupRoot: this is the case under test.
+	mgr := NewManager(NewRegistry(), &mockAuthz{}, newTestIDGen(), newProc, Config{})
+
+	jobID, err := mgr.Start(astrid, "sleep", []string{"300"})
+	if err != nil {
+		t.Fatalf("Start error: %v", err)
+	}
+	if err := mgr.Stop(t.Context(), astrid, jobID); err != nil {
+		t.Fatalf("Stop error: %v", err)
+	}
+	if !proc.wasTerminated() {
+		t.Error("Stop did not reach for the process group, so a job's children outlive it")
+	}
+}
+
+// And the other half: with a cgroup, cgroup.kill is the complete answer and
+// the weaker fallback must not be used. It reaches only the process group,
+// which anything that called setsid has already left.
+func TestManager_StopWithACgroupDoesNotUseTheFallback(t *testing.T) {
+	root := t.TempDir()
+
+	var proc *mockProcess
+	newProc := func(ctx context.Context, spec ProcessSpec) Process {
+		proc = &mockProcess{ctx: ctx}
+		return proc
+	}
+	mgr := NewManager(NewRegistry(), &mockAuthz{}, newTestIDGen(),
+		newProc, Config{CgroupRoot: root})
+
+	jobID, err := mgr.Start(astrid, "sleep", []string{"300"})
+	if err != nil {
+		t.Fatalf("Start error: %v", err)
+	}
+	if err := mgr.Stop(t.Context(), astrid, jobID); err != nil {
+		t.Fatalf("Stop error: %v", err)
+	}
+	if proc.wasTerminated() {
+		t.Error("Stop used the process-group fallback despite having a cgroup")
+	}
+	if _, err := os.ReadFile(filepath.Join(root, jobID, "cgroup.kill")); err != nil {
+		t.Errorf("Stop should have written cgroup.kill: %v", err)
 	}
 }

@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os/exec"
 	"syscall"
@@ -47,7 +48,37 @@ func NewOSProcess(ctx context.Context, spec ProcessSpec) Process {
 	}
 	cmd.SysProcAttr = attr
 
-	return cmd
+	return &osProcess{Cmd: cmd}
+}
+
+// osProcess adds Terminate to exec.Cmd, which has no way to signal a whole
+// process group.
+type osProcess struct {
+	*exec.Cmd
+}
+
+// Terminate kills the job's process group.
+//
+// The child leads its own group, set at creation by Setpgid with no Pgid, so
+// its group id equals its pid and a negative pid addresses the group. That
+// reaches children the job spawned, which cancelling the context does not: that
+// signals the leader alone and leaves the rest reparented and running.
+//
+// A process group is weaker than a cgroup, which is why it is only the
+// fallback. Anything that called setsid or setpgid has left the group and
+// survives this; leaving a cgroup takes a deliberate write to a specific file.
+func (p *osProcess) Terminate() error {
+	if p.Process == nil {
+		return nil // never started
+	}
+	if err := syscall.Kill(-p.Process.Pid, syscall.SIGKILL); err != nil {
+		// The group is already gone, which is the outcome asked for.
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		return fmt.Errorf("runner: killing the process group of pid %d: %w", p.Process.Pid, err)
+	}
+	return nil
 }
 
 // callerFault reports whether a failure from Process.Start is the caller's

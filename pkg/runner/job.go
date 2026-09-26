@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"sync"
 
@@ -59,10 +60,25 @@ func (j *Job) reap() {
 	defer func() {
 		j.cancel()
 		if j.group != nil {
-			_ = j.group.Destroy()
+			// Kill before removing, even though the job's own process has
+			// already exited. A descendant that outlived it keeps the cgroup
+			// populated, and rmdir on a populated cgroup fails, so without
+			// this both the processes and the directory leak. Stop kills on its
+			// own path; this covers a job that simply ended.
+			if err := j.group.Kill(); err != nil {
+				slog.Error("could not kill a finished job's cgroup",
+					slog.String("job", j.JobID), slog.String("err", err.Error()))
+			}
+			if err := j.group.Destroy(); err != nil {
+				slog.Error("could not remove a finished job's cgroup",
+					slog.String("job", j.JobID), slog.String("err", err.Error()))
+			}
 		}
 		if j.workDir != "" {
-			_ = os.RemoveAll(j.workDir)
+			if err := os.RemoveAll(j.workDir); err != nil {
+				slog.Error("could not remove a finished job's working directory",
+					slog.String("job", j.JobID), slog.String("err", err.Error()))
+			}
 		}
 	}()
 	// Deferred so that Stop is released even if anything below panics.

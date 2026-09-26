@@ -46,6 +46,11 @@ type Authorizer interface {
 type Process interface {
 	Start() error
 	Wait() error
+	// Terminate kills the process and everything it spawned, as far as it can
+	// without a cgroup. It is the fallback for a manager configured without
+	// one; where a cgroup exists, cgroup.kill is used instead and this is not
+	// called.
+	Terminate() error
 }
 
 // ProcessSpec describes the process a job is to run.
@@ -222,9 +227,24 @@ func (m *JobManager) Stop(ctx context.Context, actor string, jobID string) error
 	job.stopRequested = true
 	job.mu.Unlock()
 
+	// A cgroup is the complete answer: one write ends every process in it,
+	// including any that left the job's process group. Without one, the
+	// process group is all that is available, and it is still better than
+	// cancel() alone, which signals the leader and leaves its children.
 	if job.group != nil {
 		if err := job.group.Kill(); err != nil {
 			return err
+		}
+	} else {
+		select {
+		case <-job.done:
+			// Already terminal. Skip the kill: the pid behind the process
+			// group may have been reused by now, and there is nothing left to
+			// signal in any case.
+		default:
+			if err := job.cmd.Terminate(); err != nil {
+				return err
+			}
 		}
 	}
 	job.cancel()
