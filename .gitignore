@@ -4,3 +4,5 @@ state/
 
 # Build output
 /bin/
+
+msg*.txt

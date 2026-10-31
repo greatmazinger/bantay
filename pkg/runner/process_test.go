@@ -76,6 +76,12 @@ func TestCallerFault_ServerFailuresAreNotTheCallers(t *testing.T) {
 		{"too many open files", &fs.PathError{Op: "fork/exec", Path: "/bin/echo", Err: syscall.EMFILE}},
 		{"a cgroup write failed", errors.New("cgroup: writing cpu.max: permission denied")},
 		{"context cancelled", context.Canceled},
+		// clone3 refuses a UseCgroupFD it cannot honour with EINVAL, on a kernel
+		// older than 5.7 or for a destination that will not take processes. That
+		// is the server's misconfiguration and it fails every Start, so a client
+		// must not be told it sent a bad request. A null byte in argv arrives as
+		// the same errno and is caught by validateArgv before the fork.
+		{"a cgroup descriptor the kernel refused", &fs.PathError{Op: "fork/exec", Path: "/bin/echo", Err: syscall.EINVAL}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			if callerFault(tt.err) {
@@ -94,7 +100,6 @@ func TestCallerFault_RecognisesTheCallersMistakes(t *testing.T) {
 		{"no such file", &fs.PathError{Op: "fork/exec", Err: syscall.ENOENT}},
 		{"permission denied", &fs.PathError{Op: "fork/exec", Err: syscall.EACCES}},
 		{"not an executable format", &fs.PathError{Op: "fork/exec", Err: syscall.ENOEXEC}},
-		{"invalid argv", &fs.PathError{Op: "fork/exec", Err: syscall.EINVAL}},
 		{"argv larger than the kernel accepts", &fs.PathError{Op: "fork/exec", Err: syscall.E2BIG}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -127,5 +132,52 @@ func TestStart_ServerFailureIsNotErrCommand(t *testing.T) {
 	}
 	if errors.Is(err, ErrCommand) {
 		t.Errorf("err = %v, should not be labelled as the caller's mistake", err)
+	}
+}
+
+// The null byte used to be inferred from the EINVAL that fork/exec returns for
+// it, which the kernel also uses to refuse a cgroup descriptor. It is named
+// before the fork now, so the caller is told which argument is at fault and a
+// server that cannot place processes in cgroups no longer blames its clients.
+func TestStart_RejectsANullByteInArgv(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		command string
+		args    []string
+	}{
+		{"in the command", "ec\x00ho", nil},
+		{"in an argument", "echo", []string{"fine", "not\x00fine"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			mgr := NewManager(NewRegistry(), &mockAuthz{}, newTestIDGen(), NewOSProcess, Config{})
+			jobID, err := mgr.Start(astrid, tt.command, tt.args)
+			if !errors.Is(err, ErrCommand) {
+				t.Errorf("err = %v, want it to wrap ErrCommand", err)
+			}
+			if jobID != "" {
+				t.Errorf("job ID = %q, want none: no job should have been created", jobID)
+			}
+		})
+	}
+}
+
+// Nothing is created before argv is checked, so a rejected one leaves no
+// cgroup and no working directory behind.
+func TestStart_ANullByteLeavesNothingBehind(t *testing.T) {
+	root, state := t.TempDir(), t.TempDir()
+	mgr := NewManager(NewRegistry(), &mockAuthz{}, newTestIDGen(), NewOSProcess,
+		Config{CgroupRoot: root, StateDir: state})
+
+	if _, err := mgr.Start(astrid, "echo", []string{"not\x00fine"}); !errors.Is(err, ErrCommand) {
+		t.Fatalf("err = %v, want it to wrap ErrCommand", err)
+	}
+	for _, dir := range []string{root, state} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 0 {
+			t.Errorf("%s holds %d entries, want none", dir, len(entries))
+		}
 	}
 }

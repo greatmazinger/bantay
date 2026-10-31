@@ -183,8 +183,14 @@ func (s *Server) Output(req *jobmanagerv1.OutputRequest, stream grpc.ServerStrea
 		return rpcError(err)
 	}
 
-	chunk := make([]byte, 32*1024)
 	for {
+		// A fresh buffer per iteration rather than one reused across them. The
+		// bytes handed to Send belong to the message until the RPC layer is done
+		// with it: grpc-go states that a message must not be modified after
+		// SendMsg, because a stats handler or tracing library may read it
+		// lazily. Reusing this would let the next Read overwrite a chunk still
+		// being read, and deliver corrupted output to the client.
+		chunk := make([]byte, 32*1024)
 		n, err := r.Read(chunk)
 		if n > 0 {
 			if sendErr := stream.Send(&jobmanagerv1.OutputChunk{Data: chunk[:n]}); sendErr != nil {

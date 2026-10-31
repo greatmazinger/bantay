@@ -214,12 +214,15 @@ none, which would make them limits in name only.
 | Code | Condition |
 |---|---|
 | `NOT_FOUND` | The job ID is unknown, or it belongs to another caller. The two cases are deliberately indistinguishable. |
-| `INVALID_ARGUMENT` | `command` is empty, names a program that does not exist, or names one that cannot be executed. |
+| `INVALID_ARGUMENT` | `command` is empty, names a program that does not exist, or names one that cannot be executed; or `command` or an argument contains a null byte, which cannot be passed to the kernel. |
 | `UNAUTHENTICATED` | No client certificate was presented, or it carries no valid SPIFFE ID in this server's trust domain. |
-| `INTERNAL` | The server could not do its part: the job's cgroup or working directory could not be created, a limit could not be written, or the fork itself failed. A handler that panics also returns this. |
+| `INTERNAL` | The server could not do its part: the job's cgroup or working directory could not be created, a limit could not be written, or the fork itself failed -- including a kernel that will not create a process inside the job's cgroup, which fails every `Start` and is the server's misconfiguration rather than the caller's request. A handler that panics also returns this. |
 
 The line between the last two is whether a correct request from another caller
-would have failed the same way. A program that starts and then fails, such as
+would have failed the same way. The null byte is the one case where the kernel
+is no help in drawing it: `fork/exec` reports it with the same `EINVAL` it uses
+to refuse a cgroup descriptor it cannot honour, so argv is checked for one
+before anything is created rather than classified from the errno afterwards. A program that starts and then fails, such as
 `ls --foo`, is not an error at all: `Start` succeeds, the message appears in the
 job's output, and the exit code is reported by `Status`.
 

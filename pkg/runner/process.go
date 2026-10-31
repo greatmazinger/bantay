@@ -81,6 +81,26 @@ func (p *osProcess) Terminate() error {
 	return nil
 }
 
+// ExitCode reports the status the process exited with: its exit code, -1 if a
+// signal killed it, and -1 if it could not be reaped at all and there is no
+// status to report.
+//
+// It reads exec.Cmd.ProcessState, which Wait sets, so it is only meaningful
+// once Wait has returned. reap calls it from the goroutine that just returned
+// from Wait, which orders the two.
+//
+// Asking the process beats classifying the error Wait returned. os/exec
+// reports a problem with the wait itself -- an expired WaitDelay, a context
+// cancelled after the process had already finished -- only when the process
+// exited successfully, so an error there says nothing about the exit status
+// and a classifier keyed on it reads a clean exit as a signal death.
+func (p *osProcess) ExitCode() int {
+	if p.ProcessState == nil {
+		return -1
+	}
+	return p.ProcessState.ExitCode()
+}
+
 // callerFault reports whether a failure from Process.Start is the caller's
 // doing rather than the server's.
 //
@@ -88,10 +108,17 @@ func (p *osProcess) Terminate() error {
 // check rather than a clean split: os/exec reports a failed PATH lookup as
 // *exec.Error, and anything the kernel refused at fork or exec as *fs.PathError
 // carrying the errno. ENOENT, EACCES and ENOEXEC mean the program named cannot
-// be run. EINVAL means the argv could not be passed, which is how a null byte
-// in an argument arrives, and E2BIG means the caller sent more of it than the
-// kernel accepts. Everything else, EAGAIN and ENOMEM among them, is the server
-// failing to do its part.
+// be run, and E2BIG means the caller sent more argv than the kernel accepts.
+// Everything else, EAGAIN and ENOMEM among them, is the server failing to do
+// its part.
+//
+// EINVAL is deliberately not here, though a null byte in argv arrives as one.
+// clone3 also refuses a UseCgroupFD it cannot honour with EINVAL -- a kernel
+// older than 5.7, or a destination it will not accept processes into -- and
+// that is the server's own misconfiguration, reported on every single Start.
+// Treating the errno as the caller's would blame, and leak detail to, a client
+// that cannot do anything about it. The null byte is caught by validateArgv
+// before the fork instead, where it can be named exactly.
 //
 // The distinction matters because it decides what the client is told. A caller
 // who misspelled a binary can fix that; a caller who hit a process limit on the
@@ -106,7 +133,6 @@ func callerFault(err error) bool {
 		return errors.Is(pathErr.Err, fs.ErrNotExist) ||
 			errors.Is(pathErr.Err, fs.ErrPermission) ||
 			errors.Is(pathErr.Err, syscall.ENOEXEC) ||
-			errors.Is(pathErr.Err, syscall.EINVAL) ||
 			errors.Is(pathErr.Err, syscall.E2BIG)
 	}
 	return false

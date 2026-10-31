@@ -95,16 +95,36 @@ func (j *Job) reap() {
 // setTerminal records the process's outcome under the job's lock. The state
 // depends on intent rather than on the wait error: a killed process reports an
 // ExitError either way, so only stopRequested distinguishes STOPPED from DONE.
+//
+// The exit code comes from the process, not from waitErr. os/exec reports a
+// failure of the wait itself -- an expired WaitDelay, a context cancelled after
+// the process had already finished -- only for a process that exited
+// successfully, so reading one of those as a signal death would report a clean
+// exit as -1. waitErr is still kept, as the reason behind the outcome.
 func (j *Job) setTerminal(waitErr error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	j.err = waitErr
-	j.exitCode = exitCode(waitErr)
+	j.exitCode = j.cmd.ExitCode()
 	if j.stopRequested {
 		j.state = StateStopped
 	} else {
 		j.state = StateDone
 	}
+}
+
+// terminate ends the job's process and the processes it spawned, by the best
+// means the manager was configured with.
+//
+// Stop deliberately does not call this. Its fallback is guarded by the job's
+// terminal state, because the pid behind a process group may have been reused
+// by then, while its cgroup path is left unguarded so that a reissued Stop
+// still reaches cgroup.kill and proves that a redundant one is harmless.
+func (j *Job) terminate() error {
+	if j.group != nil {
+		return j.group.Kill()
+	}
+	return j.cmd.Terminate()
 }
 
 // JobSnapshot is a point-in-time read of a job's observable state. The fields

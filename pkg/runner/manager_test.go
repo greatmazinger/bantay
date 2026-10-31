@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -32,6 +33,11 @@ type mockProcess struct {
 	out      io.Writer
 	output   []byte
 
+	// exitCode is what ExitCode reports. Written by Wait and read by the
+	// manager only after Wait has returned, which is the same ordering the real
+	// process relies on, so it needs no lock.
+	exitCode int
+
 	// terminated records whether Stop reached for the process-group fallback,
 	// which it only does for a manager configured without a cgroup.
 	mu         sync.Mutex
@@ -57,10 +63,15 @@ func (m *mockProcess) Start() error {
 	return m.startErr
 }
 
+func (m *mockProcess) ExitCode() int {
+	return m.exitCode
+}
+
 func (m *mockProcess) Wait() error {
 	// If a context was provided, we block until the context is canceled.
 	if m.ctx != nil {
 		<-m.ctx.Done()
+		m.exitCode = -1 // what a real process killed by a signal reports
 		return errKilled
 	}
 	if m.out != nil {
@@ -535,6 +546,7 @@ type steppedProcess struct {
 
 func (p *steppedProcess) Start() error     { return nil }
 func (p *steppedProcess) Terminate() error { return nil }
+func (p *steppedProcess) ExitCode() int    { return 0 }
 
 func (p *steppedProcess) Wait() error {
 	for i, step := range p.steps {
@@ -664,6 +676,10 @@ func (p *blockingProcess) Start() error { return nil }
 // Deliberately does not release: this mock exists so a test can hold the job
 // running while it checks that Stop has not returned. The test releases it.
 func (p *blockingProcess) Terminate() error { return nil }
+
+// Reports what a real process killed by a signal does, to match the errKilled
+// its Wait returns.
+func (p *blockingProcess) ExitCode() int { return -1 }
 
 func (p *blockingProcess) Wait() error {
 	<-p.release
@@ -834,5 +850,51 @@ func TestManager_StopWithACgroupDoesNotUseTheFallback(t *testing.T) {
 	}
 	if _, err := os.ReadFile(filepath.Join(root, jobID, "cgroup.kill")); err != nil {
 		t.Errorf("Stop should have written cgroup.kill: %v", err)
+	}
+}
+
+// A job that exited cleanly reports 0, even when the wait around it failed.
+//
+// os/exec substitutes an error of its own -- an expired WaitDelay, a context
+// cancelled after the process had already finished -- only when the process
+// itself exited successfully, so such an error says nothing about the exit
+// status. Deriving the code from it reported a clean exit as -1, which the
+// schema documents as a signal death.
+//
+// Verified against a real process too: `sh -c 'sleep 30 & exit 0'` leaves the
+// backgrounded sleep holding the output pipe, so the pipe never reports EOF,
+// the 5s WaitDelay ends the wait, and Wait returns ErrWaitDelay for a process
+// whose ProcessState says exit status 0. That takes five seconds of wall clock
+// to reproduce, so the contract is pinned here instead.
+func TestManager_CleanExitWithAFailedWaitReportsZero(t *testing.T) {
+	synctest.Test(t, testCleanExitWithAFailedWaitReportsZero)
+}
+
+func testCleanExitWithAFailedWaitReportsZero(t *testing.T) {
+	newProc := func(ctx context.Context, spec ProcessSpec) Process {
+		// No ctx, so Wait returns at once and the job reaps itself with nobody
+		// stopping it. exitCode is left at zero: the process exited 0, and only
+		// the wait around it went wrong.
+		return &mockProcess{waitErr: exec.ErrWaitDelay}
+	}
+	mgr := NewManager(NewRegistry(), &mockAuthz{}, newTestIDGen(), newProc, Config{})
+
+	jobID, err := mgr.Start(astrid, "sh", []string{"-c", "sleep 30 & exit 0"})
+	if err != nil {
+		t.Fatalf("Start error: %v", err)
+	}
+	// Nothing to wait on: no Stop is issued, so wait for the reaper to record
+	// the outcome and go away.
+	synctest.Wait()
+
+	snap, err := mgr.Status(astrid, jobID)
+	if err != nil {
+		t.Fatalf("Status error: %v", err)
+	}
+	if snap.State != StateDone {
+		t.Errorf("state = %q, want %q", snap.State, StateDone)
+	}
+	if snap.ExitCode != 0 {
+		t.Errorf("exit code = %d, want 0: the process exited cleanly and only the wait failed", snap.ExitCode)
 	}
 }
